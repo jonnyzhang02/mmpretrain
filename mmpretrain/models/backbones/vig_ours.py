@@ -545,7 +545,8 @@ class PyramidVigOurs(BaseBackbone):
             Defaults to None.
     """  # noqa: E501
     arch_settings = {
-        'tiny': dict(blocks=[2, 2, 6, 2], channels=[48, 96, 240, 384]),
+        # 'tiny': dict(blocks=[2, 2, 6, 2], channels=[48, 96, 240, 384]),
+        'tiny' : dict(blocks=[2, 2, 6, 2], channels=[48, 96, 120, 192]),
         'small': dict(blocks=[2, 2, 6, 2], channels=[80, 160, 400, 640]),
         'medium': dict(blocks=[2, 2, 16, 2], channels=[96, 192, 384, 768]),
         'base': dict(blocks=[2, 2, 18, 2], channels=[128, 256, 512, 1024]),
