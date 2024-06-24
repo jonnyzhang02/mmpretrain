@@ -17,7 +17,7 @@ model = dict(
     neck=dict(type='GlobalAveragePooling'),
     head=dict(
         type='VigClsHead',
-        num_classes=6,
+        num_classes=7,
         in_channels=192,
         hidden_dim=256,
         act_cfg=dict(type='GELU'),

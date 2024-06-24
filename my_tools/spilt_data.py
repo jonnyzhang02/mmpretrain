@@ -29,5 +29,5 @@ def split_dataset(data_dir, train_size=0.8):
             shutil.move(os.path.join(class_dir, file), os.path.join(test_dir, file))
 
 # Example usage:
-data_directory = '/home/zhangyang/ssd/Classification/mmpretrain/data/SAR-ACD'  # Update this path to your dataset directory
+data_directory = '/home/zhangyang/ssd/Classification/mmpretrain/data/FUSAR/MarineCategory'  # Update this path to your dataset directory
 split_dataset(data_directory)

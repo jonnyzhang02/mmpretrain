@@ -40,7 +40,7 @@ def calculate_mean_std(directory):
 
 # Example usage
 if __name__ == "__main__":
-    dataset_path = 'data/SAR-ACD/train'  # Adjust this path to point to your 'train' directory
+    dataset_path = 'data/FUSAR/train'  # Adjust this path to point to your 'train' directory
     mean, std = calculate_mean_std(dataset_path)
     if mean is not None and std is not None:
         print(f"Mean: {mean}")
