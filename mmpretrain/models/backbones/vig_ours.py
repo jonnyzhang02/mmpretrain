@@ -15,6 +15,7 @@ from torch.nn.modules.batchnorm import _BatchNorm
 from mmpretrain.models.backbones.base_backbone import BaseBackbone
 from mmpretrain.registry import MODELS
 from ..utils import build_norm_layer
+import cv2
 
 
 def get_2d_relative_pos_embed(embed_dim, grid_size):
@@ -123,6 +124,66 @@ def xy_dense_knn_matrix(x, y, k=16, relative_pos=None):
             0, n_points, device=x.device).repeat(batch_size, k,
                                                  1).transpose(2, 1)
     return torch.stack((nn_idx, center_idx), dim=0)
+
+def harris_corner_detection_and_topk_corners(feature_maps, k=0.04, block_size=2, ksize=3, top_k=16):
+    """
+    Harris corner detection on a batch of feature maps using OpenCV and PyTorch,
+    and return the top K corners for each feature map with normalized coordinates.
+
+    Args:
+        feature_maps: Input feature maps (B, C, H, W).
+        k: Harris detector free parameter.
+        block_size: It is the size of neighbourhood considered for corner detection.
+        ksize: Aperture parameter of Sobel derivative used.
+        top_k: Number of top corners to return.
+
+    Returns:
+        corners_list: (B, num_points, 2)
+    """
+    batch_size, num_channels, height, width = feature_maps.shape
+    corners_list = []
+
+    for i in range(batch_size):
+        # Convert the feature map to a single channel by averaging across channels
+        feature_map = feature_maps[i].mean(dim=0).cpu().detach().numpy()
+
+        # Ensure feature_map is in the right type
+        feature_map = np.float32(feature_map)
+
+        # Detecting corners using OpenCV
+        dst = cv2.cornerHarris(feature_map, block_size, ksize, k)
+
+        # Result is dilated for marking the corners, not important
+        dst = cv2.dilate(dst, None)
+
+        # Convert the response back to a PyTorch tensor
+        harris_response = torch.tensor(dst, dtype=torch.float32, device=feature_maps.device)
+
+        # Extract top K corners
+        topk_values, topk_indices = torch.topk(harris_response.view(-1), top_k)
+        topk_coords = torch.stack((torch.div(topk_indices, width, rounding_mode='floor'), topk_indices % width), dim=-1)
+
+        # Normalize the coordinates
+        topk_coords = topk_coords.float()
+        topk_coords[:, 0] /= height
+        topk_coords[:, 1] /= width
+
+        # Append the normalized top K corners for the current feature map
+        corners_list.append(topk_coords)
+
+    # Stack the list of top K corners into a single tensor
+    corners_list = torch.stack(corners_list, dim=0)
+    
+    return corners_list
+
+def calculate_harris_corner_loss(tensor1, tensor2):
+    B = tensor1.shape[0]
+    num_points = tensor1.shape[1]
+    tensor1_flattened = tensor1.view(B, num_points*2)
+    tensor2_flattened = tensor2.view(B, num_points*2)
+
+    # 计算每个batch内的余弦相似度
+    return F.cosine_similarity(tensor1_flattened, tensor2_flattened, dim=1)
 
 
 class DenseDilated(nn.Module):
@@ -659,14 +720,24 @@ class PyramidVigOurs(BaseBackbone):
     def forward(self, inputs):
         outs = []
         x = self.stem(inputs) + self.pos_embed
+        harris_loss = calculate_harris_corner_loss(
+            harris_corner_detection_and_topk_corners(inputs), 
+            harris_corner_detection_and_topk_corners(x)
+            ).mean()
 
         for i, blocks in enumerate(self.stages):
             x = blocks(x)
 
-            if i in self.out_indices:
-                outs.append(x)
+            # if i in self.out_indices:
+            outs.append(x)
 
-        return tuple(outs)
+        target_size = outs[0].size()[2:]  # (H, W)
+        # 将所有特征图调整到相同的大小
+        resized_outs = [F.interpolate(out, size=target_size, mode='bilinear', align_corners=False) for out in outs]
+        # 在通道维度上拼接
+        concatenated = torch.cat(resized_outs, dim=1)
+
+        return (harris_loss, [outs[-1]])
 
     def _freeze_stages(self):
         self.stem.eval()

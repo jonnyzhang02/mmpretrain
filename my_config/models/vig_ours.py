@@ -14,9 +14,9 @@ model = dict(
         drop_path=0.1,
         norm_eval=False,
         frozen_stages=0),
-    neck=dict(type='GlobalAveragePooling'),
+    neck=dict(type='GlobalAveragePoolingOurs'),
     head=dict(
-        type='VigClsHead',
+        type='VigHeadOurs',
         num_classes=7,
         in_channels=192,
         hidden_dim=256,
