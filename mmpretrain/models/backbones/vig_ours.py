@@ -16,6 +16,7 @@ from mmpretrain.models.backbones.base_backbone import BaseBackbone
 from mmpretrain.registry import MODELS
 from ..utils import build_norm_layer
 import cv2
+import matplotlib.pyplot as plt
 
 
 def get_2d_relative_pos_embed(embed_dim, grid_size):
@@ -125,56 +126,130 @@ def xy_dense_knn_matrix(x, y, k=16, relative_pos=None):
                                                  1).transpose(2, 1)
     return torch.stack((nn_idx, center_idx), dim=0)
 
-def harris_corner_detection_and_topk_corners(feature_maps, k=0.04, block_size=2, ksize=3, top_k=16):
+def harris_corner_detection_and_topk_corners(feature_maps, vi=0, k=0.04, block_size=2, ksize=3, top_k=16, threshold=0.01):
     """
-    Harris corner detection on a batch of feature maps using OpenCV and PyTorch,
-    and return the top K corners for each feature map with normalized coordinates.
-
-    Args:
-        feature_maps: Input feature maps (B, C, H, W).
-        k: Harris detector free parameter.
-        block_size: It is the size of neighbourhood considered for corner detection.
-        ksize: Aperture parameter of Sobel derivative used.
-        top_k: Number of top corners to return.
-
-    Returns:
-        corners_list: (B, num_points, 2)
+    Improved Harris corner detection with thresholding, non-maximum suppression, and optional visualization.
     """
     batch_size, num_channels, height, width = feature_maps.shape
     corners_list = []
 
     for i in range(batch_size):
-        # Convert the feature map to a single channel by averaging across channels
         feature_map = feature_maps[i].mean(dim=0).cpu().detach().numpy()
-
-        # Ensure feature_map is in the right type
         feature_map = np.float32(feature_map)
-
-        # Detecting corners using OpenCV
         dst = cv2.cornerHarris(feature_map, block_size, ksize, k)
-
-        # Result is dilated for marking the corners, not important
         dst = cv2.dilate(dst, None)
 
-        # Convert the response back to a PyTorch tensor
-        harris_response = torch.tensor(dst, dtype=torch.float32, device=feature_maps.device)
+        # Apply threshold to the Harris response
+        _, dst_thresh = cv2.threshold(dst, threshold * dst.max(), 255, 0)
+        dst_thresh = dst_thresh.astype(np.uint8)
+        corners = cv2.goodFeaturesToTrack(dst_thresh, maxCorners=top_k, qualityLevel=0.01, minDistance=5)
 
-        # Extract top K corners
-        topk_values, topk_indices = torch.topk(harris_response.view(-1), top_k)
-        topk_coords = torch.stack((torch.div(topk_indices, width, rounding_mode='floor'), topk_indices % width), dim=-1)
+        # Normalize and convert to tensor
+        if corners is not None:
+            corners = torch.tensor(corners, dtype=torch.float32, device=feature_maps.device).squeeze(1)
+            corners[:, 0] /= width
+            corners[:, 1] /= height
+        else:
+            corners = torch.zeros((0, 2), dtype=torch.float32, device=feature_maps.device)
 
-        # Normalize the coordinates
-        topk_coords = topk_coords.float()
-        topk_coords[:, 0] /= height
-        topk_coords[:, 1] /= width
+        # 保证top_k个角点
+        if corners.size(0) < top_k:
+            # Randomly sample with replacement
+            indices = torch.randint(0, corners.size(0), (top_k - corners.size(0),), device=feature_maps.device)
+            additional_corners = corners[indices]
+            corners = torch.cat([corners, additional_corners], dim=0)
 
-        # Append the normalized top K corners for the current feature map
-        corners_list.append(topk_coords)
+        corners_list.append(corners)
 
-    # Stack the list of top K corners into a single tensor
+    if vi:
+        corners = corners_list[0].cpu()
+        # Visualization of corners on the feature map
+        plt.figure(figsize=(10, 10))
+        plt.imshow(feature_maps[0].mean(dim=0).cpu().detach().numpy(), cmap='gray')
+        if corners is not None:
+            corners_unnorm = corners.clone()
+            corners_unnorm[:, 0] *= width
+            corners_unnorm[:, 1] *= height
+            plt.scatter(corners_unnorm[:, 0], corners_unnorm[:, 1], c='r', s=100, marker='x')
+        plt.savefig('harris.png')
+
     corners_list = torch.stack(corners_list, dim=0)
-    
     return corners_list
+
+# def harris_corner_detection_and_topk_corners(feature_maps, k=0.04, block_size=2, ksize=3, top_k=16):
+#     """
+#     Harris corner detection on a batch of feature maps using OpenCV and PyTorch,
+#     and return the top K corners for each feature map with normalized coordinates.
+
+#     Args:
+#         feature_maps: Input feature maps (B, C, H, W).
+#         k: Harris detector free parameter.
+#         block_size: It is the size of neighbourhood considered for corner detection.
+#         ksize: Aperture parameter of Sobel derivative used.
+#         top_k: Number of top corners to return.
+
+#     Returns:
+#         corners_list: (B, num_points, 2)
+#     """
+#     batch_size, num_channels, height, width = feature_maps.shape
+#     corners_list = []
+
+#     for i in range(batch_size):
+#         # Convert the feature map to a single channel by averaging across channels
+#         feature_map = feature_maps[i].mean(dim=0).cpu().detach().numpy()
+
+#         # Ensure feature_map is in the right type
+#         feature_map = np.float32(feature_map)
+
+#         # Detecting corners using OpenCV
+#         dst = cv2.cornerHarris(feature_map, block_size, ksize, k)
+
+#         # Result is dilated for marking the corners, not important
+#         dst = cv2.dilate(dst, None)
+
+#         # Convert the response back to a PyTorch tensor
+#         harris_response = torch.tensor(dst, dtype=torch.float32, device=feature_maps.device)
+
+#         # Extract top K corners
+#         topk_values, topk_indices = torch.topk(harris_response.view(-1), top_k)
+#         topk_coords = torch.stack((torch.div(topk_indices, width, rounding_mode='floor'), topk_indices % width), dim=-1)
+
+#         # Normalize the coordinates
+#         topk_coords = topk_coords.float()
+#         topk_coords[:, 0] /= height
+#         topk_coords[:, 1] /= width
+
+#         # Append the normalized top K corners for the current feature map
+#         corners_list.append(topk_coords)
+
+#         # # Visualization
+#         # visualize_corners(feature_map, topk_coords, height, width)
+
+#     # Stack the list of top K corners into a single tensor
+#     corners_list = torch.stack(corners_list, dim=0)
+    
+#     return corners_list
+
+def visualize_corners(feature_map, corners, height, width):
+    """
+    Visualize corners on a feature map.
+
+    Args:
+        feature_map: A single channel feature map.
+        corners: Normalized coordinates of the corners (num_points, 2).
+        height: Height of the feature map.
+        width: Width of the feature map.
+    """
+    corners = corners.cpu()
+    plt.figure(figsize=(8, 8))
+    plt.imshow(feature_map, cmap='gray')
+    corners_denorm = corners.clone().detach()
+    corners_denorm[:, 0] *= height
+    corners_denorm[:, 1] *= width
+    plt.scatter(corners_denorm[:, 1], corners_denorm[:, 0], c='r', s=40)
+    plt.title("Harris Corners Visualization")
+    plt.show()
+    plt.savefig('harris.png')
 
 def calculate_harris_corner_loss(tensor1, tensor2):
     B = tensor1.shape[0]
@@ -184,6 +259,33 @@ def calculate_harris_corner_loss(tensor1, tensor2):
 
     # 计算每个batch内的余弦相似度
     return F.cosine_similarity(tensor1_flattened, tensor2_flattened, dim=1)
+
+def visualize_feature_map(tensor, figname, batch_idx=0, channel_idx=0):
+    """
+    可视化特征图的函数。
+    
+    参数:
+        tensor (torch.Tensor): 输入的四维tensor，维度为 [B, C, H, W]。
+        batch_idx (int): 选择要可视化的批次索引。
+        channel_idx (int): 选择要可视化的通道索引，长度为3或1。
+    
+    返回:
+        None
+    """
+
+    # 提取单通道图像并删除通道维度
+    img = tensor[batch_idx, channel_idx, :, :].detach().cpu().numpy()
+    img = np.expand_dims(img, axis=-1)  # 为了显示灰度图，扩展维度
+
+    # 归一化图像以获得更好的视觉效果
+    img -= img.min()
+    img /= img.max()
+
+    # 显示图像
+    plt.imshow(img, cmap='gray' if img.shape[-1] == 1 else None)
+    plt.title(f'Batch {batch_idx}, Channels {channel_idx}')
+    plt.savefig(figname)
+
 
 
 class DenseDilated(nn.Module):
@@ -566,6 +668,88 @@ class FFN(nn.Module):
         x = self.fc2(x)
         x = self.drop_path(x) + shortcut
         return x
+    
+
+class SaliencyExtractor(nn.Module):
+    def __init__(self, kernel_size_factor=0.1, sigma=3):
+        super(SaliencyExtractor, self).__init__()
+        self.kernel_size_factor = kernel_size_factor
+        self.sigma = sigma
+
+    def generate_gaussian_kernel(self, size, sigma):
+        """生成二维高斯核"""
+        kx = cv2.getGaussianKernel(size, sigma)
+        ky = cv2.getGaussianKernel(size, sigma)
+        kernel = np.outer(kx, ky)
+        return torch.tensor(kernel, dtype=torch.float32)
+
+    def apply_gaussian_to_points(self, feature_map, points):
+        """基于harris角点提取显著区域"""
+        B, C, height, width = feature_map.shape
+        kernel_size = self.determine_kernel_size(min(height, width))
+        kernel = self.generate_gaussian_kernel(kernel_size, self.sigma)
+        half_size = kernel_size // 2
+
+        saliency_maps = torch.zeros((B, height, width), dtype=torch.float32)
+
+        for b in range(B):
+            for point in points[b]:
+                x = int(point[0] * width)
+                y = int(point[1] * height)
+                # 在 (x, y) 位置应用高斯核
+                x_min = max(x - half_size, 0)
+                x_max = min(x + half_size + 1, width)
+                y_min = max(y - half_size, 0)
+                y_max = min(y + half_size + 1, height)
+                
+                kx_min = half_size - (x - x_min)
+                kx_max = half_size + (x_max - x)
+                ky_min = half_size - (y - y_min)
+                ky_max = half_size + (y_max - y)
+                
+                saliency_maps[b, y_min:y_max, x_min:x_max] += kernel[ky_min:ky_max, kx_min:kx_max]
+
+        return saliency_maps
+
+    def determine_kernel_size(self, feature_map_size):
+        """根据特征图的尺寸确定高斯核大小"""
+        size = int(feature_map_size * self.kernel_size_factor)
+        return size if size % 2 == 1 else size + 1
+
+    def forward(self, feature_map, points):
+        self.saliency_maps = self.apply_gaussian_to_points(feature_map, points) 
+        self.visual()
+        return self.apply_gaussian_to_points(feature_map, points)   
+
+    def visual(self):
+        # 将显著性图转换为numpy以便可视化
+        saliency_map_np = self.saliency_maps[0].detach().numpy()
+
+        # 显示结果
+        plt.imshow(saliency_map_np, cmap='hot')
+        plt.colorbar()
+        plt.show() 
+        plt.savefig('gauss.png')
+    
+class TargetEnhanceModule(nn.Module):
+    def __init__(self):
+        super(TargetEnhanceModule, self).__init__()
+    
+    def forward(self, x, saliency_ex):
+        O_obj = x * saliency_ex
+
+        return O_obj
+
+
+class BackgroundMixModule(nn.Module):
+    def __init__(self):
+        super(BackgroundMixModule, self).__init__()
+
+    def forward(self, x, saliency_ex):
+        O_env = x * (1 - saliency_ex)
+
+        return O_env
+
 
 @MODELS.register_module()
 class PyramidVigOurs(BaseBackbone):
@@ -690,6 +874,8 @@ class PyramidVigOurs(BaseBackbone):
                         build_norm_layer(norm_cfg, mid_channels),
                     ))
                 HW = HW // 4
+
+            
             for _ in range(num_blocks):
                 blocks.append(
                     Sequential(
@@ -720,22 +906,58 @@ class PyramidVigOurs(BaseBackbone):
     def forward(self, inputs):
         outs = []
         x = self.stem(inputs) + self.pos_embed
+        # visualize_feature_map(inputs, 'input.png')
+        # visualize_feature_map(x, 'x.png')
         harris_loss = calculate_harris_corner_loss(
             harris_corner_detection_and_topk_corners(inputs), 
             harris_corner_detection_and_topk_corners(x)
             ).mean()
+        saliency_ex = SaliencyExtractor()
+        target_enhance_module = TargetEnhanceModule()
+        background_mix_module = BackgroundMixModule()
+        
 
         for i, blocks in enumerate(self.stages):
+            saliency_map = saliency_ex(x, harris_corner_detection_and_topk_corners(x))
+            x_target_enhanced = target_enhance_module(x, saliency_map)
+            x_background_mixed = background_mix_module(x, saliency_map)
+
+            x = torch.concat(x_target_enhanced, x_background_mixed, dim=1)
+
             x = blocks(x)
 
             # if i in self.out_indices:
             outs.append(x)
 
-        target_size = outs[0].size()[2:]  # (H, W)
-        # 将所有特征图调整到相同的大小
-        resized_outs = [F.interpolate(out, size=target_size, mode='bilinear', align_corners=False) for out in outs]
-        # 在通道维度上拼接
-        concatenated = torch.cat(resized_outs, dim=1)
+        # ############ attention module ##############
+
+        # target_size = outs[0].size()[2:]  # (H, W)
+        # # 将所有特征图调整到相同的大小
+        # resized_outs = [F.interpolate(out, size=target_size, mode='bilinear', align_corners=False) for out in outs]
+        # # 在通道维度上拼接
+        # concatenated = torch.cat(resized_outs, dim=1)
+
+        # B, C, H, W = concatenated.size()
+        # reshaped_features = concatenated.view(B, C, H*W)
+        # B, C_f, H_f , W_f = outs[-1].size()
+        # reshaped_features_f = outs[-1].view(B, C_f, H_f*W_f)
+
+
+        # # 生成位置编码
+        # position_embedding = generate_position_embedding(H, W, C)
+        # position_embedding_f = generate_position_embedding(H_f, W_f, C_f)
+        # # 添加位置编码
+        # embedded_features = reshaped_features + position_embedding
+        # embedded_features_f = reshaped_features_f + position_embedding_f
+
+        # # 注意力计算
+        # attention = torch.matmul(embedded_features.transpose(1, 2), 
+        #                          embedded_features_f)
+        # attention = F.softmax(attention, dim=-1)
+        # # 加权和
+        # attended_features = torch.matmul(attention, embedded_features_f.transpose(1, 2))
+        # # 重塑输出
+        # attended_features = attended_features.view(B, C, H, W)
 
         return (harris_loss, [outs[-1]])
 
