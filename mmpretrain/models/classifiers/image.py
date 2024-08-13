@@ -86,6 +86,7 @@ class ImageClassifier(BaseClassifier):
 
     def forward(self,
                 inputs: torch.Tensor,
+                inputs2: torch.Tensor,
                 data_samples: Optional[List[DataSample]] = None,
                 mode: str = 'tensor'):
         """The unified entry for a forward process in both training and test.
@@ -119,13 +120,13 @@ class ImageClassifier(BaseClassifier):
             feats = self.extract_feat(inputs)
             return self.head(feats) if self.with_head else feats
         elif mode == 'loss':
-            return self.loss(inputs, data_samples)
+            return self.loss(inputs, inputs2, data_samples, mode=mode)
         elif mode == 'predict':
-            return self.predict(inputs, data_samples)
+            return self.predict(inputs, inputs2, data_samples, mode=mode)
         else:
             raise RuntimeError(f'Invalid mode "{mode}".')
 
-    def extract_feat(self, inputs, stage='neck'):
+    def extract_feat(self, inputs, inputs2, stage='neck', mode='loss'):
         """Extract features from the input tensor with shape (N, C, ...).
 
         Args:
@@ -201,7 +202,7 @@ class ImageClassifier(BaseClassifier):
             (f'Invalid output stage "{stage}", please choose from "backbone", '
              '"neck" and "pre_logits"')
 
-        x = self.backbone(inputs)
+        x = self.backbone(inputs, inputs2, mode)
 
         if stage == 'backbone':
             return x
@@ -216,7 +217,9 @@ class ImageClassifier(BaseClassifier):
         return self.head.pre_logits(x)
 
     def loss(self, inputs: torch.Tensor,
-             data_samples: List[DataSample]) -> dict:
+             inputs2: torch.Tensor,
+             data_samples: List[DataSample],
+             mode) -> dict:
         """Calculate losses from a batch of inputs and data samples.
 
         Args:
@@ -228,12 +231,14 @@ class ImageClassifier(BaseClassifier):
         Returns:
             dict[str, Tensor]: a dictionary of loss components
         """
-        feats = self.extract_feat(inputs)
+        feats = self.extract_feat(inputs, inputs2, mode=mode)
         return self.head.loss(feats, data_samples)
 
     def predict(self,
                 inputs: torch.Tensor,
+                inputs2: torch.Tensor,
                 data_samples: Optional[List[DataSample]] = None,
+                mode: str = 'predict',
                 **kwargs) -> List[DataSample]:
         """Predict results from a batch of inputs.
 
@@ -245,7 +250,7 @@ class ImageClassifier(BaseClassifier):
             **kwargs: Other keyword arguments accepted by the ``predict``
                 method of :attr:`head`.
         """
-        feats = self.extract_feat(inputs)
+        feats = self.extract_feat(inputs, inputs2, mode=mode)
         return self.head.predict(feats, data_samples, **kwargs)
 
     def get_layer_depth(self, param_name: str):

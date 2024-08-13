@@ -134,6 +134,9 @@ class PackInputs(BaseTransform):
         if self.input_key in results:
             input_ = results[self.input_key]
             packed_results['inputs'] = self.format_input(input_)
+        if 'img2' in results:
+            input_ = results['img2']
+            packed_results['inputs2'] = self.format_input(input_)
 
         data_sample = DataSample()
 

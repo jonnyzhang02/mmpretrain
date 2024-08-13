@@ -94,6 +94,8 @@ class VigHeadOurs(ClsHead):
         """
         # The part can be traced by torch.fx
         harris_loss = feats[0]
+        theta_loss = feats[1]
+        theta_loss = theta_loss[0].mean()
         feats = tuple(feats[-1])
         cls_score = self(feats)
 
@@ -101,7 +103,8 @@ class VigHeadOurs(ClsHead):
         losses = self._get_loss(cls_score, data_samples, **kwargs)
 
         # Add harris loss
-        losses['loss'] += 0.1 * harris_loss
+        losses['loss'] += 0.1 * harris_loss[0]
+        losses['loss'] += 0.1 * theta_loss
 
         return losses
 

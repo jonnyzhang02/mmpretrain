@@ -151,6 +151,54 @@ class ClsDataPreprocessor(BaseDataPreprocessor):
             # Combine padding and stack
             inputs = stack_batch(processed_inputs, self.pad_size_divisor,
                                  self.pad_value)
+            
+        if training:   
+            inputs2 = self.cast_data(data['inputs2'])
+
+            if isinstance(inputs2, torch.Tensor):
+                # The branch if use `default_collate` as the collate_fn in the
+                # dataloader.
+
+                # ------ To RGB ------
+                if self.to_rgb and inputs2.size(1) == 3:
+                    inputs2 = inputs2.flip(1)
+
+                # -- Normalization ---
+                inputs2 = inputs2.float()
+                if self._enable_normalize:
+                    inputs2 = (inputs2 - self.mean) / self.std
+
+                # ------ Padding -----
+                if self.pad_size_divisor > 1:
+                    h, w = inputs2.shape[-2:]
+
+                    target_h = math.ceil(
+                        h / self.pad_size_divisor) * self.pad_size_divisor
+                    target_w = math.ceil(
+                        w / self.pad_size_divisor) * self.pad_size_divisor
+                    pad_h = target_h - h
+                    pad_w = target_w - w
+                    inputs2 = F.pad(inputs2, (0, pad_w, 0, pad_h), 'constant',
+                                self.pad_value)
+            else:
+                # The branch if use `pseudo_collate` as the collate_fn in the
+                # dataloader.
+
+                processed_inputs = []
+                for input_ in inputs2:
+                    # ------ To RGB ------
+                    if self.to_rgb and input_.size(0) == 3:
+                        input_ = input_.flip(0)
+
+                    # -- Normalization ---
+                    input_ = input_.float()
+                    if self._enable_normalize:
+                        input_ = (input_ - self.mean) / self.std
+
+                    processed_inputs.append(input_)
+                # Combine padding and stack
+                inputs2 = stack_batch(processed_inputs, self.pad_size_divisor,
+                                    self.pad_value)
 
         data_samples = data.get('data_samples', None)
         sample_item = data_samples[0] if data_samples is not None else None
@@ -181,6 +229,9 @@ class ClsDataPreprocessor(BaseDataPreprocessor):
             if (training and self.batch_augments is not None
                     and batch_score is not None):
                 inputs, batch_score = self.batch_augments(inputs, batch_score)
+            if (training and self.batch_augments is not None
+                    and batch_score is not None):
+                inputs2, batch_score = self.batch_augments(inputs, batch_score)
 
             # ----- scatter labels and scores to data samples ---
             if batch_label is not None:
@@ -194,7 +245,10 @@ class ClsDataPreprocessor(BaseDataPreprocessor):
         elif isinstance(sample_item, MultiTaskDataSample):
             data_samples = self.cast_data(data_samples)
 
-        return {'inputs': inputs, 'data_samples': data_samples}
+        if not training:
+            inputs2 = inputs
+
+        return {'inputs': inputs,'inputs2':inputs2 , 'data_samples': data_samples}
 
 
 @MODELS.register_module()

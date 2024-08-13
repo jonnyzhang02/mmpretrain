@@ -34,6 +34,7 @@ class GlobalAveragePoolingOurs(nn.Module):
 
     def forward(self, inputs):
         harris_loss = inputs[0]
+        theta_loss = inputs[1]
         inputs = tuple(inputs[-1])
         if isinstance(inputs, tuple):
             outs = tuple([self.gap(x) for x in inputs])
@@ -44,4 +45,4 @@ class GlobalAveragePoolingOurs(nn.Module):
             outs = outs.view(inputs.size(0), -1)
         else:
             raise TypeError('neck inputs should be tuple or torch.tensor')
-        return (harris_loss, outs)
+        return (harris_loss, theta_loss, outs)

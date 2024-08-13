@@ -31,7 +31,7 @@ test_pipeline = [
 ]
 
 train_dataloader = dict(
-    batch_size=32,
+    batch_size=16,
     num_workers=5,
     dataset=dict(
         type=dataset_type, data_root="data/SAR-ACD/train", pipeline=train_pipeline
@@ -40,7 +40,7 @@ train_dataloader = dict(
 )
 
 val_dataloader = dict(
-    batch_size=32,
+    batch_size=16,
     num_workers=5,
     dataset=dict(
         type=dataset_type, data_root="data/SAR-ACD/test", pipeline=test_pipeline

@@ -11,12 +11,21 @@ from mmcv.cnn import build_activation_layer
 from mmcv.cnn.bricks import DropPath
 from mmengine.model import ModuleList, Sequential
 from torch.nn.modules.batchnorm import _BatchNorm
+from mmengine.logging import MMLogger
+from mmengine.model import BaseModule
+import math
+import mmcv
+import random
+import copy
 
 from mmpretrain.models.backbones.base_backbone import BaseBackbone
 from mmpretrain.registry import MODELS
 from ..utils import build_norm_layer
 import cv2
 import matplotlib.pyplot as plt
+from torch.utils.tensorboard import SummaryWriter
+writer = SummaryWriter('./runs')
+import time
 
 
 def get_2d_relative_pos_embed(embed_dim, grid_size):
@@ -126,7 +135,8 @@ def xy_dense_knn_matrix(x, y, k=16, relative_pos=None):
                                                  1).transpose(2, 1)
     return torch.stack((nn_idx, center_idx), dim=0)
 
-def harris_corner_detection_and_topk_corners(feature_maps, vi=0, k=0.04, block_size=2, ksize=3, top_k=16, threshold=0.01):
+
+def harris_corner_detection_and_topk_corners(feature_maps, vi=0, k=0.04, block_size=2, ksize=3, top_k=64, threshold=0.01):
     """
     Improved Harris corner detection with thresholding, non-maximum suppression, and optional visualization.
     """
@@ -142,7 +152,7 @@ def harris_corner_detection_and_topk_corners(feature_maps, vi=0, k=0.04, block_s
         # Apply threshold to the Harris response
         _, dst_thresh = cv2.threshold(dst, threshold * dst.max(), 255, 0)
         dst_thresh = dst_thresh.astype(np.uint8)
-        corners = cv2.goodFeaturesToTrack(dst_thresh, maxCorners=top_k, qualityLevel=0.01, minDistance=5)
+        corners = cv2.goodFeaturesToTrack(dst_thresh, maxCorners=top_k, qualityLevel=0.005, minDistance=5)
 
         # Normalize and convert to tensor
         if corners is not None:
@@ -150,7 +160,7 @@ def harris_corner_detection_and_topk_corners(feature_maps, vi=0, k=0.04, block_s
             corners[:, 0] /= width
             corners[:, 1] /= height
         else:
-            corners = torch.zeros((0, 2), dtype=torch.float32, device=feature_maps.device)
+            corners = torch.zeros((top_k, 2), dtype=torch.float32, device=feature_maps.device)
 
         # 保证top_k个角点
         if corners.size(0) < top_k:
@@ -671,7 +681,7 @@ class FFN(nn.Module):
     
 
 class SaliencyExtractor(nn.Module):
-    def __init__(self, kernel_size_factor=0.1, sigma=3):
+    def __init__(self, kernel_size_factor=0.5, sigma=3):
         super(SaliencyExtractor, self).__init__()
         self.kernel_size_factor = kernel_size_factor
         self.sigma = sigma
@@ -683,8 +693,20 @@ class SaliencyExtractor(nn.Module):
         kernel = np.outer(kx, ky)
         return torch.tensor(kernel, dtype=torch.float32)
 
+    # def creat_gauss_kernel(kernel_size=3, sigma=1, k=1):
+    #     if sigma == 0:
+    #         sigma = ((kernel_size - 1) * 0.5 - 1) * 0.3 + 0.8
+    #     X = np.linspace(-k, k, kernel_size)
+    #     Y = np.linspace(-k, k, kernel_size)
+    #     x, y = np.meshgrid(X, Y)
+    #     x0 = 0
+    #     y0 = 0
+    #     gauss = 1/(2*np.pi*sigma**2) * np.exp(- ((x -x0)**2 + (y - y0)**2)/ (2 * sigma**2))
+    #     return gauss
+
     def apply_gaussian_to_points(self, feature_map, points):
         """基于harris角点提取显著区域"""
+        # TODO 修改并理解高斯特征
         B, C, height, width = feature_map.shape
         kernel_size = self.determine_kernel_size(min(height, width))
         kernel = self.generate_gaussian_kernel(kernel_size, self.sigma)
@@ -709,6 +731,9 @@ class SaliencyExtractor(nn.Module):
                 
                 saliency_maps[b, y_min:y_max, x_min:x_max] += kernel[ky_min:ky_max, kx_min:kx_max]
 
+        # 归一化显著性图
+        saliency_maps /= saliency_maps.max()
+
         return saliency_maps
 
     def determine_kernel_size(self, feature_map_size):
@@ -718,7 +743,7 @@ class SaliencyExtractor(nn.Module):
 
     def forward(self, feature_map, points):
         self.saliency_maps = self.apply_gaussian_to_points(feature_map, points) 
-        self.visual()
+        # self.visual()
         return self.apply_gaussian_to_points(feature_map, points)   
 
     def visual(self):
@@ -732,23 +757,601 @@ class SaliencyExtractor(nn.Module):
         plt.savefig('gauss.png')
     
 class TargetEnhanceModule(nn.Module):
-    def __init__(self):
+    def __init__(self, device, channels=32, out_channels=None):
         super(TargetEnhanceModule, self).__init__()
+        self.channels = channels
+        self.out_channels = out_channels if out_channels is not None else self.channels
+        # 定义非线性层
+        self.query_transform = nn.Sequential(
+            nn.Conv2d(self.channels, self.out_channels, kernel_size=1, device=device),
+            build_norm_layer(dict(type='BN'), self.out_channels).to(device),
+            )
+        self.key_transform = nn.Sequential(
+            nn.Conv2d(self.channels, self.out_channels, kernel_size=1, device=device),
+            build_norm_layer(dict(type='BN'), self.out_channels).to(device),
+            )
+        self.value_transform = nn.Sequential(
+            nn.Conv2d(self.channels, self.out_channels, kernel_size=1, device=device),
+            build_norm_layer(dict(type='BN'), self.out_channels).to(device),
+        )
+
+    def forward(self, x, saliency_map):
+        # 应用显著性图
+        self.channels = x.shape[1]
+        mask = saliency_map.unsqueeze(1)  # B x 1 x H x W
+        masked_x = x * mask  # 应用显著性图筛选特征区域
+
+        # 转换为Query, Key, Value
+        query = self.query_transform(masked_x)
+        key = self.key_transform(x)
+        value = self.value_transform(x)
+
+        # 计算注意力得分
+        batch, channels, height, width = key.shape
+        query = query.view(batch, channels, -1)  # B x C x N
+        key = key.view(batch, channels, -1)  # B x C x N
+        value = value.view(batch, channels, -1)  # B x C x N
+
+        attention_scores = torch.bmm(query.permute(0, 2, 1), key)  # B x N x N
+        attention = F.softmax(attention_scores, dim=-1)  # Softmax on last dimension
+
+        # 得到加权的Value向量
+        enhanced_features = torch.bmm(value, attention)  # B x C x N
+        enhanced_features = enhanced_features.view(batch, channels, height, width)  # Reshape back to original
+
+        return enhanced_features
     
-    def forward(self, x, saliency_ex):
-        O_obj = x * saliency_ex
+################以下是背景模块################
+    
+def get_abs_pos(abs_pos, has_cls_token, hw):
+    h, w = hw
+    if has_cls_token:
+        abs_pos = abs_pos[:, 1:]
+    xy_num = abs_pos.shape[1]
+    size = int(math.sqrt(xy_num))
+    assert size * size == xy_num
 
-        return O_obj
+    if size != h or size != w:
+        new_abs_pos = F.interpolate(
+            abs_pos.reshape(1, size, size, -1).permute(0, 3, 1, 2),
+            size=(h, w),
+            mode='bicubic',
+            align_corners=False,
+        )
+
+        return new_abs_pos.permute(0, 2, 3, 1)
+    else:
+        return abs_pos.reshape(1, h, w, -1)
+
+def get_rel_pos(q_size, k_size, rel_pos):
+    """
+    Get relative positional embeddings according to the relative positions
+    of query and key sizes.
+    Args:
+        q_size (int): size of query q.
+        k_size (int): size of key k.
+        rel_pos (Tensor): relative position embeddings (L, C).
+
+    Returns:
+        Extracted positional embeddings according to relative positions.
+    """
+    max_rel_dist = int(2 * max(q_size, k_size) - 1)
+    # Interpolate rel pos if needed.
+    if rel_pos.shape[0] != max_rel_dist:
+        # Interpolate rel pos.
+        rel_pos_resized = F.interpolate(
+            rel_pos.reshape(1, rel_pos.shape[0], -1).permute(0, 2, 1),
+            size=max_rel_dist,
+            mode='linear',
+        )
+        rel_pos_resized = rel_pos_resized.reshape(-1,
+                                                  max_rel_dist).permute(1, 0)
+    else:
+        rel_pos_resized = rel_pos
+
+    # Scale the coords with short length if shapes for q and k are different.
+    q_coords = torch.arange(q_size)[:, None] * max(k_size / q_size, 1.0)
+    k_coords = torch.arange(k_size)[None, :] * max(q_size / k_size, 1.0)
+    relative_coords = (q_coords -
+                       k_coords) + (k_size - 1) * max(q_size / k_size, 1.0)
+
+    return rel_pos_resized[relative_coords.long()]
+
+def add_decomposed_rel_pos(attn, q, rel_pos_h, rel_pos_w, q_size, k_size):
+    """
+    Args:
+        attn (Tensor): attention map.
+        q (Tensor):
+            query q in the attention layer with shape (B, q_h * q_w, C).
+        rel_pos_h (Tensor):
+            relative position embeddings (Lh, C) for height axis.
+        rel_pos_w (Tensor):
+            relative position embeddings (Lw, C) for width axis.
+        q_size (Tuple):
+            spatial sequence size of query q with (q_h, q_w).
+        k_size (Tuple):
+            spatial sequence size of key k with (k_h, k_w).
+
+    Returns:
+        attn (Tensor): attention map with added relative positional embeddings.
+    """
+    q_h, q_w = q_size
+    k_h, k_w = k_size
+    Rh = get_rel_pos(q_h, k_h, rel_pos_h)
+    Rw = get_rel_pos(q_w, k_w, rel_pos_w)
+
+    B, _, dim = q.shape
+    r_q = q.reshape(B, q_h, q_w, dim)
+    rel_h = torch.einsum('bhwc,hkc->bhwk', r_q, Rh)
+    rel_w = torch.einsum('bhwc,wkc->bhwk', r_q, Rw)
+
+    attn = (attn.view(B, q_h, q_w, k_h, k_w) + rel_h[:, :, :, :, None] +
+            rel_w[:, :, :, None, :]).view(B, q_h * q_w, k_h * k_w)
+
+    return attn
+
+def window_partition(x, window_size):
+    """
+    Args:
+        x: (B, H, W, C)
+        window_size (int): window size
+    Returns:
+        windows: (num_windows*B, window_size, window_size, C)
+    """
+    B, H, W, C = x.shape
+
+    pad_h = (window_size - H % window_size) % window_size
+    pad_w = (window_size - W % window_size) % window_size
+    if pad_h > 0 or pad_w > 0:
+        x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))
+    Hp, Wp = H + pad_h, W + pad_w
+
+    x = x.view(B, Hp // window_size, window_size, Wp // window_size,
+               window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4,
+                        5).contiguous().view(-1, window_size, window_size, C)
+    return windows, (Hp, Wp)
+
+def window_unpartition(windows, window_size, pad_hw, hw):
+    """
+    Args:
+        windows: (num_windows*B, window_size, window_size, C)
+        window_size (int): Window size
+        H (int): Height of image
+        W (int): Width of image
+    Returns:
+        x: (B, H, W, C)
+    """
+    Hp, Wp = pad_hw
+    H, W = hw
+    B = windows.shape[0] // (Hp * Wp // window_size // window_size)
+    x = windows.view(B, Hp // window_size, Wp // window_size, window_size,
+                     window_size, -1)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, Hp, Wp, -1)
+
+    if Hp > H or Wp > W:
+        x = x[:, :H, :W, :].contiguous()
+    return x
+
+class Mlp(nn.Module):
+    """MLP as used in Vision Transformer, MLP-Mixer and related networks."""
+
+    def __init__(
+            self,
+            in_features,
+            hidden_features=None,
+            out_features=None,
+            act_cfg=dict(type='GELU'),
+            bias=True,
+            drop=0.,
+    ):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+
+        self.fc1 = nn.Linear(in_features, hidden_features, bias=bias)
+        self.act = build_activation_layer(act_cfg)
+        self.drop1 = nn.Dropout(drop)
+        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias)
+        self.drop2 = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop1(x)
+        x = self.fc2(x)
+        x = self.drop2(x)
+        return x
+
+class Attention(nn.Module):
+
+    def __init__(self,
+                 dim,
+                 num_heads=8,
+                 qkv_bias=True,
+                 use_rel_pos=False,
+                 rel_pos_zero_init=True,
+                 input_size=None):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim**-0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.proj = nn.Linear(dim, dim)
+
+        self.use_rel_pos = use_rel_pos
+        if self.use_rel_pos:
+            # initialize relative positional embeddings
+            self.rel_pos_h = nn.Parameter(
+                torch.zeros(2 * input_size[0] - 1, head_dim))
+            self.rel_pos_w = nn.Parameter(
+                torch.zeros(2 * input_size[1] - 1, head_dim))
+
+            if not rel_pos_zero_init:
+                nn.init.trunc_normal_(self.rel_pos_h, std=0.02)
+                nn.init.trunc_normal_(self.rel_pos_w, std=0.02)
+
+    def forward(self, x):
+        B, H, W, _ = x.shape
+        # qkv with shape (3, B, nHead, H * W, C)
+        qkv = self.qkv(x).reshape(B, H * W, 3, self.num_heads,
+                                  -1).permute(2, 0, 3, 1, 4)
+        # q, k, v with shape (B * nHead, H * W, C)
+        q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
+
+        attn = (q * self.scale) @ k.transpose(-2, -1)
+
+        if self.use_rel_pos:
+            attn = add_decomposed_rel_pos(attn, q, self.rel_pos_h,
+                                          self.rel_pos_w, (H, W), (H, W))
+
+        attn = attn.softmax(dim=-1)
+        x = (attn @ v).view(B, self.num_heads, H, W,
+                            -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
+        x = self.proj(x)
+
+        return x
+
+class PatchEmbed(nn.Module):
+    """Image to Patch Embedding."""
+
+    def __init__(self,
+                 kernel_size=(16, 16),
+                 stride=(16, 16),
+                 padding=(0, 0),
+                 in_chans=3,
+                 embed_dim=768):
+        """
+        Args:
+            kernel_size (Tuple): kernel size of the projection layer.
+            stride (Tuple): stride of the projection layer.
+            padding (Tuple): padding size of the projection layer.
+            in_chans (int): Number of input image channels.
+            embed_dim (int):  embed_dim (int): Patch embedding dimension.
+        """
+        super().__init__()
+
+        self.proj = nn.Conv2d(
+            in_chans,
+            embed_dim,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding)
+
+    def forward(self, x):
+        x = self.proj(x)
+        # B C H W -> B H W C
+        x = x.permute(0, 2, 3, 1)
+        return x
+
+class Block(nn.Module):
+
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        mlp_ratio=4.0,
+        qkv_bias=True,
+        drop_path=0.0,
+        norm_cfg=dict(type='LN', eps=1e-6),
+        act_cfg=dict(type='GELU'),
+        use_rel_pos=False,
+        rel_pos_zero_init=True,
+        window_size=0,
+        input_size=None,
+    ):
+        super().__init__()
+        self.norm1 = mmcv.cnn.build_norm_layer(norm_cfg, dim)[1]
+        self.attn = Attention(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            use_rel_pos=use_rel_pos,
+            rel_pos_zero_init=rel_pos_zero_init,
+            input_size=input_size if window_size == 0 else
+            (window_size, window_size),
+        )
+
+        self.drop_path = DropPath(
+            drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = mmcv.cnn.build_norm_layer(norm_cfg, dim)[1]
+        self.mlp = Mlp(
+            in_features=dim,
+            hidden_features=int(dim * mlp_ratio),
+            act_cfg=act_cfg)
+
+        self.window_size = window_size
+
+    def forward(self, x):
+        shortcut = x
+        x = self.norm1(x)
+        # Window partition
+        if self.window_size > 0:
+            H, W = x.shape[1], x.shape[2]
+            x, pad_hw = window_partition(x, self.window_size)
+
+        x = self.attn(x)
+        # Reverse window partition
+        if self.window_size > 0:
+            x = window_unpartition(x, self.window_size, pad_hw, (H, W))
+
+        x = shortcut + self.drop_path(x)
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+
+        return x
+    
+class BackgroundMixModule(BaseModule):
+    """Vision Transformer with support for patch or hybrid CNN input stage."""
+
+    def __init__(self,
+                 img_size=224,
+                 patch_size=4,
+                 in_chans=3,
+                 embed_dim=394,
+                 depth=3,
+                 num_heads=1,
+                 mlp_ratio=4.0,
+                 qkv_bias=True,
+                 drop_path_rate=0.0,
+                 norm_cfg=dict(type='LN', eps=1e-6),
+                 act_cfg=dict(type='GELU'),
+                 use_abs_pos=True,
+                 use_rel_pos=False,
+                 rel_pos_zero_init=True,
+                 window_size=0,
+                 window_block_indexes=(0, 1, 3, 4, 6, 7, 9, 10),
+                 pretrain_img_size=224,
+                 pretrain_use_cls_token=True,
+                 init_cfg=None):
+
+        super().__init__()
+        self.pretrain_use_cls_token = pretrain_use_cls_token
+        self.init_cfg = init_cfg
+
+        self.patch_embed = PatchEmbed(
+            kernel_size=(patch_size, patch_size),
+            stride=(patch_size, patch_size),
+            in_chans=in_chans,
+            embed_dim=embed_dim)
+
+        if use_abs_pos:
+            num_patches = (pretrain_img_size // patch_size) * (
+                pretrain_img_size // patch_size)
+            num_positions = (num_patches +
+                             1) if pretrain_use_cls_token else num_patches
+            self.pos_embed = nn.Parameter(
+                torch.zeros(1, num_positions, embed_dim))
+        else:
+            self.pos_embed = None
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+
+        self.blocks = nn.ModuleList([
+            Block(
+                dim=embed_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                drop_path=dpr[i],
+                norm_cfg=norm_cfg,
+                act_cfg=act_cfg,
+                use_rel_pos=use_rel_pos,
+                rel_pos_zero_init=rel_pos_zero_init,
+                window_size=window_size if i in window_block_indexes else 0,
+                input_size=(img_size // patch_size, img_size // patch_size))
+            for i in range(depth)
+        ])
+
+        if self.pos_embed is not None:
+            nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=0.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def init_weights(self):
+        logger = MMLogger.get_current_instance()
+        if self.init_cfg is None:
+            logger.warn(f'No pre-trained weights for '
+                        f'{self.__class__.__name__}, '
+                        f'training start from scratch')
+            self.apply(self._init_weights)
+        # else:
+        #     assert 'checkpoint' in self.init_cfg, f'Only support ' \
+        #                                           f'specify `Pretrained` in ' \
+        #                                           f'`init_cfg` in ' \
+        #                                           f'{self.__class__.__name__} '
+        #     ckpt = CheckpointLoader.load_checkpoint(
+        #         self.init_cfg.checkpoint, logger=logger, map_location='cpu')
+        #     if 'model' in ckpt:
+        #         _state_dict = ckpt['model']
+        #     self.load_state_dict(_state_dict, False)
+
+    def forward(self, x, saliency_map):
+        background_mask = 1 - saliency_map.unsqueeze(1)
+        self.to(x.device)
+
+        x = x * background_mask
+
+        x = self.patch_embed(x)
+        if self.pos_embed is not None:
+            x = x + get_abs_pos(self.pos_embed, self.pretrain_use_cls_token,
+                                (x.shape[1], x.shape[2]))
+
+        for blk in self.blocks:
+            x = blk(x)
+
+        x = x.permute(0, 3, 1, 2)
+
+        return x
+    
+def affine_transform(tensor, theta):
+    """
+    对大小为BCHW的torch.tensor进行仿射变换
+    
+    参数:
+    tensor (torch.Tensor): 输入张量，形状为[B, C, H, W]
+    theta (torch.Tensor): 仿射变换矩阵，形状为[B, 2, 3]
+    
+    返回:
+    torch.Tensor: 变换后的张量
+    """
+    
+    # 生成仿射网格
+    grid = F.affine_grid(theta, tensor.size(), align_corners=False).to(tensor.device)
+    
+    # 进行采样
+    transformed_tensor = F.grid_sample(tensor, grid, align_corners=False)
+    
+    return transformed_tensor
+
+def random_affine_matrix(batch_size, scale_range=(0.8, 1.2), rotation_range=(-30, 30)):
+    """
+    生成随机的缩放和旋转仿射变换矩阵
+    
+    参数:
+    batch_size (int): 批量大小
+    scale_range (tuple): 缩放范围 (min_scale, max_scale)
+    rotation_range (tuple): 旋转范围 (min_angle, max_angle) in degrees
+    
+    返回:
+    torch.Tensor: 仿射变换矩阵，形状为[B, 2, 3]
+    """
+    min_scale, max_scale = scale_range
+    min_angle, max_angle = rotation_range
+
+    scales = torch.FloatTensor(batch_size).uniform_(min_scale, max_scale)
+    angles = torch.FloatTensor(batch_size).uniform_(min_angle, max_angle)
+
+    thetas = []
+
+    for i in range(batch_size):
+        scale = scales[i].item()
+        angle = angles[i].item()
+        
+        angle_rad = math.radians(angle)
+        cos_theta = math.cos(angle_rad)
+        sin_theta = math.sin(angle_rad)
+        
+        # 组合缩放和旋转矩阵
+        affine_matrix = torch.tensor([
+            [scale * cos_theta, -scale * sin_theta, 0],
+            [scale * sin_theta,  scale * cos_theta, 0]
+        ])
+        
+        thetas.append(affine_matrix)
+    
+    # 转换为Tensor并添加偏移量列
+    thetas = torch.stack(thetas)
+    
+    return thetas
+
+class AffineTransformNet(nn.Module):
+    def __init__(self, input_shape):
+        super(AffineTransformNet, self).__init__()
+        B, C, H, W = input_shape
+        self.conv = nn.Conv2d(2*C, C, kernel_size=3, padding=1)
+        self.fc1 = nn.Linear(C*H*W, 64)
+        self.fc2 = nn.Linear(64, 6)  # 输出仿射变换矩阵参数
+
+    def forward(self, x1, x2):
+        self.conv.to(x1.device)
+        self.fc1.to(x1.device)
+        self.fc2.to(x1.device)
+        x = torch.cat((x1, x2), dim=1)  # 拼接两个特征图
+        x = F.relu(self.conv(x))
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        theta = self.fc2(x)
+        theta = theta.view(-1, 2, 3)  # 将输出变为仿射变换矩阵的形状
+        return theta
+    
+# class BackgroundMixModule(nn.Module):
+#     def __init__(self, channels,device, num_samples=10):
+#         super(BackgroundMixModule, self).__init__()
+#         self.channels = channels
+#         self.num_samples = num_samples
+#         self.scale_factor = 0.5  # 缩放因子，可根据需要调整
+#         self.background_token_layer = nn.Linear(channels, channels).to(device)
+
+#     def forward(self, x, saliency_map):
+#         B, C, H, W = x.shape
+#         # TODO 重新理解并按照ViT重写
+        
+#         # 背景mask（1 - saliency_map 表示背景）
+#         background_mask = 1 - saliency_map.unsqueeze(1)
 
 
-class BackgroundMixModule(nn.Module):
-    def __init__(self):
-        super(BackgroundMixModule, self).__init__()
+        
+#         # # 随机采样背景位置
+#         # background_idx = background_mask.nonzero(as_tuple=True)
+#         # num_background = len(background_idx[0])
+#         # if num_background > self.num_samples: 
+#         #     sampled_idx = torch.randperm(num_background)[:self.num_samples]
+#         # else:
+#         #     sampled_idx = torch.arange(num_background)
 
-    def forward(self, x, saliency_ex):
-        O_env = x * (1 - saliency_ex)
+#         # if num_background > 0:
+#         #     sampled_background_idx = (background_idx[0][sampled_idx], 
+#         #                               background_idx[1][sampled_idx], 
+#         #                               background_idx[2][sampled_idx], 
+#         #                               background_idx[3][sampled_idx])
+#         #     # 获取背景相关的token
+#         #     background_tokens = x[sampled_background_idx]
+#         #     if background_tokens.numel() < C:
+#         #         # 使用零填充补充到合适的大小
+#         #         padding = torch.zeros(C - background_tokens.numel(), device=x.device)
+#         #         background_tokens = torch.cat([background_tokens.flatten(), padding]).view(-1, C)
+#         #     if background_tokens.dim() < 4:
+#         #         background_tokens = background_tokens.unsqueeze(0)  # 保证至少有一个批处理维度
+#         #     background_tokens = background_tokens.reshape(-1, C)
+#         #     enhanced_background_tokens = self.background_token_layer(background_tokens)
+#         #     # 取均值后保持维度一致，以便正确扩展
+#         #     enhanced_background_tokens = enhanced_background_tokens.mean(dim=0, keepdim=True).unsqueeze(-1).unsqueeze(-1)
+#         #     enhanced_background_tokens = enhanced_background_tokens.expand(B, -1, H, W)
+#         # else:
+#         #     enhanced_background_tokens = torch.zeros_like(x)
 
-        return O_env
+#         # # 插值引入全局噪声
+#         # global_noise = F.interpolate(x, scale_factor=self.scale_factor, mode='bilinear', align_corners=False)
+#         # global_noise = F.interpolate(global_noise, size=(H, W), mode='bilinear', align_corners=False)
+        
+#         # # 位置嵌入标签
+#         # pos_embeddings = torch.randn(B, C, H, W, device=x.device)
+        
+#         # # 背景与全局噪声结合
+#         # combined_background = background_mask * global_noise + (1 - background_mask) * pos_embeddings
+        
+#         # # 融合原始特征、增强背景和增强的背景tokens
+#         # enhanced_features = combined_background + x + enhanced_background_tokens
+
+#         return enhanced_features
 
 
 @MODELS.register_module()
@@ -792,6 +1395,7 @@ class PyramidVigOurs(BaseBackbone):
     arch_settings = {
         # 'tiny': dict(blocks=[2, 2, 6, 2], channels=[48, 96, 240, 384]),
         'tiny' : dict(blocks=[2, 2, 6, 2], channels=[48, 96, 120, 192]),
+        # 'tiny' : dict(blocks=[2, 2, 6, 2], channels=[96, 192, 240, 384]),
         'small': dict(blocks=[2, 2, 6, 2], channels=[80, 160, 400, 640]),
         'medium': dict(blocks=[2, 2, 16, 2], channels=[96, 192, 384, 768]),
         'base': dict(blocks=[2, 2, 18, 2], channels=[128, 256, 512, 1024]),
@@ -819,6 +1423,10 @@ class PyramidVigOurs(BaseBackbone):
         self.num_stages = len(self.blocks)
         channels = arch['channels']
         self.channels = channels
+        self.norm_cfg = norm_cfg
+        self.act_cfg = act_cfg
+        self.current_batch = 0
+        self.current_epoch = 0
 
         if isinstance(out_indices, int):
             out_indices = [out_indices]
@@ -903,31 +1511,163 @@ class PyramidVigOurs(BaseBackbone):
         self.norm_eval = norm_eval
         self.frozen_stages = frozen_stages
 
-    def forward(self, inputs):
+    def forward(self, inputs, inputs2, mode):
         outs = []
+        flag = 0
+
+        if random.random() < 0.5:
+            flag = 1
+            theta = random_affine_matrix(inputs.size(0))
+            inputs2 = affine_transform(inputs, theta)
+            
         x = self.stem(inputs) + self.pos_embed
-        # visualize_feature_map(inputs, 'input.png')
-        # visualize_feature_map(x, 'x.png')
         harris_loss = calculate_harris_corner_loss(
             harris_corner_detection_and_topk_corners(inputs), 
             harris_corner_detection_and_topk_corners(x)
-            ).mean()
-        saliency_ex = SaliencyExtractor()
-        target_enhance_module = TargetEnhanceModule()
-        background_mix_module = BackgroundMixModule()
-        
+        ).mean()
 
+        with open('currentbatch.txt', 'r') as f:
+            self.current_batch = int(f.read())
+        self.current_batch += 1
+        with open('currentbatch.txt', 'w') as f:
+            f.write(str(self.current_batch))
+
+        with open('currentepoch.txt', 'r') as f:
+            self.current_epoch = int(f.read())
+        
+        with open('currentmode.txt', 'r') as f:
+            last_mode = f.read()
+
+        if last_mode != mode:
+            with open('currentmode.txt', 'w') as f:
+                    f.write(mode)
+            with open('currentbatch.txt', 'w') as f:
+                    f.write('0')
+
+            if mode == 'predict':
+                self.current_epoch += 1
+                with open('currentepoch.txt', 'w') as f:
+                    f.write(str(self.current_epoch))
+            
+        print(' - mode:', mode, ' - current_epoch: ', self.current_epoch,  ' - current_batch:', self.current_batch)
+        
+        if mode == 'predict':
+            writer.add_image(f'input_{self.current_epoch}_{self.current_batch}', inputs[0], global_step=self.current_epoch, dataformats='CHW')
+            writer.add_image(f'input_stem_{self.current_epoch}_{self.current_batch}', x[0][0], dataformats='HW')
+
+
+        ###############dual branch################
+        if mode == 'loss' and flag == 1:
+            stages_dual = copy.deepcopy(self.stages)
+            x_t = self.stem(inputs2) + self.pos_embed 
+            harris_loss_t = calculate_harris_corner_loss(
+                harris_corner_detection_and_topk_corners(inputs2), 
+                harris_corner_detection_and_topk_corners(x_t)
+            ).mean()
+            saliency_ex_t = SaliencyExtractor()
+            outs_t = []
+            for i, blocks in enumerate(stages_dual):
+                saliency_map_t = saliency_ex_t(x_t, harris_corner_detection_and_topk_corners(x)).to(x.device)
+                target_enhance_module_t = TargetEnhanceModule(device=x_t.device, channels=x_t.size(1))
+                x_target_enhanced_t = target_enhance_module_t(x_t, saliency_map_t)
+                background_mix_module_t = BackgroundMixModule(img_size=x_t.size(2),
+                                                        in_chans=x_t.size(1),
+                                                        embed_dim=x_t.size(1),
+                                                        patch_size=1)
+                x_background_mixed_t = background_mix_module_t(x_t, saliency_map_t)
+
+                C = x.size(1)
+                x_t = torch.concat((x_t, x_target_enhanced_t, x_background_mixed_t), dim=1)
+
+                conv1x1_x = nn.Sequential(
+                    nn.Conv2d(in_channels=3 * C, out_channels=C, kernel_size=1).to(x.device),
+                    build_norm_layer(self.norm_cfg, C).to(x.device),
+                )
+                x_t = conv1x1_x(x_t)
+                x_t = blocks(x_t)
+                outs_t.append(x)  
+            harris_loss = harris_loss + harris_loss_t
+
+        ############original branch##############
+        # visualize_feature_map(inputs, 'input.png')
+        # visualize_feature_map(x, 'x.png')
+        saliency_ex = SaliencyExtractor()
+        
         for i, blocks in enumerate(self.stages):
-            saliency_map = saliency_ex(x, harris_corner_detection_and_topk_corners(x))
+            saliency_map = saliency_ex(x, harris_corner_detection_and_topk_corners(x)).to(x.device)
+            target_enhance_module = TargetEnhanceModule(device=x.device, channels=x.size(1))
             x_target_enhanced = target_enhance_module(x, saliency_map)
+
+            if mode == 'predict':
+                writer.add_image(f'feature_map_{self.current_epoch}_{self.current_batch}_block_{i}', x[0][0], dataformats='HW')
+                writer.add_image(f'saliency_mapsp_{self.current_epoch}_{self.current_batch}_block_{i}', saliency_map[0], dataformats='HW')
+
+            # TODO 加入tensorboard
+            # TODO 双分支
+            background_mix_module = BackgroundMixModule(img_size=x.size(2),
+                                                        in_chans=x.size(1),
+                                                        embed_dim=x.size(1),
+                                                        patch_size=1)
             x_background_mixed = background_mix_module(x, saliency_map)
 
-            x = torch.concat(x_target_enhanced, x_background_mixed, dim=1)
+            C = x.size(1)
+            x = torch.concat((x, x_target_enhanced, x_background_mixed), dim=1)
 
+            # 1*1卷积通道数减半
+            conv1x1_x = nn.Sequential(
+                nn.Conv2d(in_channels=3 * C, out_channels=C, kernel_size=1).to(x.device),
+                build_norm_layer(self.norm_cfg, C).to(x.device),
+            )
+            x = conv1x1_x(x)
+
+            # conv1x1_target = nn.Sequential(
+            #     nn.Conv2d(in_channels=C, out_channels= C//2, kernel_size=1).to(x.device),
+            #     build_norm_layer(self.norm_cfg, C // 2).to(x.device),
+            # )
+            # x_target_enhanced = conv1x1_target(x_target_enhanced)
+
+            # conv1x1_background = nn.Sequential(
+            #     nn.Conv2d(in_channels=C, out_channels= C//8, kernel_size=1).to(x.device),
+            #     build_norm_layer(self.norm_cfg, C // 2).to(x.device),
+            # )
+            # x_background_mixed = conv1x1_background(x_background_mixed)
+
+
+            # x = torch.concat((x, x_target_enhanced), dim=1)
+                        
             x = blocks(x)
+            # writer.add_graph(blocks, input_to_model = x_target_enhanced)
 
             # if i in self.out_indices:
-            outs.append(x)
+            outs.append(x)  
+
+        theta_loss = 0
+        if mode == 'loss' and flag == 1:
+            theta_loss = 0
+            theta = AffineTransformNet(outs[-1].size())
+            theta = theta(x, x_t)
+            theta_loss += torch.norm(theta)
+            harris_loss = harris_loss + harris_loss_t
+
+        return (harris_loss, theta_loss), [outs[-1]]
+
+    def _freeze_stages(self):
+        self.stem.eval()
+        for i in range(self.frozen_stages):
+            m = self.stages[i]
+            m.eval()
+            for param in m.parameters():
+                param.requires_grad = False
+
+    def train(self, mode=True):
+        super(PyramidVigOurs, self).train(mode)
+        self._freeze_stages()
+        if mode and self.norm_eval:
+            for m in self.modules():
+                # trick: eval have effect on BatchNorm only
+                if isinstance(m, _BatchNorm):
+                    m.eval()
+
 
         # ############ attention module ##############
 
@@ -959,21 +1699,3 @@ class PyramidVigOurs(BaseBackbone):
         # # 重塑输出
         # attended_features = attended_features.view(B, C, H, W)
 
-        return (harris_loss, [outs[-1]])
-
-    def _freeze_stages(self):
-        self.stem.eval()
-        for i in range(self.frozen_stages):
-            m = self.stages[i]
-            m.eval()
-            for param in m.parameters():
-                param.requires_grad = False
-
-    def train(self, mode=True):
-        super(PyramidVigOurs, self).train(mode)
-        self._freeze_stages()
-        if mode and self.norm_eval:
-            for m in self.modules():
-                # trick: eval have effect on BatchNorm only
-                if isinstance(m, _BatchNorm):
-                    m.eval()
